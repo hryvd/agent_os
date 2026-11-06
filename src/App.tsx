@@ -1115,6 +1115,12 @@ export default function App() {
                               <span>{checks[c.id].detail}</span>
                             </div>
                           )}
+                          {checks[c.id]?.models?.length > 0 && (
+                            <details className="available-models">
+                              <summary>Available model IDs</summary>
+                              <pre>{checks[c.id].models.join("\n")}</pre>
+                            </details>
+                          )}
                           <div className="card-actions">
                             <button
                               className="button secondary"
@@ -1181,12 +1187,12 @@ export default function App() {
                       <div>
                         <strong>Google Antigravity</strong>
                         <p>
-                          Direct adapter not implemented. Official CLI integration
-                          remains unverified; this app does not reuse private
-                          sign-in data.
+                          Use model IDs exposed by your configured OmniRoute
+                          Antigravity provider. Direct control of Google's IDE
+                          or CLI is not implemented.
                         </p>
                       </div>
-                      <span className="neutral-badge">Not connected</span>
+                      <span className="neutral-badge">Via gateway</span>
                     </div>
                     <div className="fine-print">
                       <Cpu size={15} />
@@ -2495,6 +2501,14 @@ function DrivePanel({
   const [authorizing, setAuthorizing] = useState(false);
   const [project, setProject] = useState(state.workspaces[0]?.id || "");
   const [folderId, setFolderId] = useState("");
+  const [snapshots, setSnapshots] = useState<
+    { id: string; name: string; modifiedTime?: string; size?: string }[] | null
+  >(null);
+  const [snapshotId, setSnapshotId] = useState("");
+  const [restoreParent, setRestoreParent] = useState("");
+  const [restoreName, setRestoreName] = useState("");
+  const [restoreError, setRestoreError] = useState("");
+  const [restoredPath, setRestoredPath] = useState("");
   const connected = !!(status?.connected || status?.status === "connected");
   const check = useCallback(() => {
     if (!isDesktop) return;
@@ -2523,6 +2537,19 @@ function DrivePanel({
   useEffect(() => {
     if (!project && state.workspaces.length) setProject(state.workspaces[0].id);
   }, [project, state.workspaces]);
+  function chooseSnapshot(fileId: string, files = snapshots) {
+    setSnapshotId(fileId);
+    const file = files?.find((item) => item.id === fileId);
+    setRestoreName(
+      (file?.name || "restored-project")
+        .replace(/\.zip$/i, "")
+        .replace(/[<>:"/\\|?*\x00-\x1f]/g, "-")
+        .replace(/[. ]+$/g, "")
+        .slice(0, 90) + "-restored",
+    );
+    setRestoreError("");
+    setRestoredPath("");
+  }
   return (
     <section className="surface-card drive-panel">
       <div className="drive-header">
@@ -2645,7 +2672,7 @@ function DrivePanel({
               </select>
             </label>
             <label>
-              Drive folder ID · optional
+              Upload Drive folder ID · optional
               <input
                 value={folderId}
                 onChange={(e) => setFolderId(e.target.value)}
@@ -2662,7 +2689,10 @@ function DrivePanel({
                   workspaceId: project,
                   folderId: folderId || undefined,
                 });
-                if (r) notify("Project snapshot uploaded to Google Drive.");
+                if (r) {
+                  notify("Project snapshot uploaded to Google Drive.");
+                  setSnapshots(null);
+                }
               }}
             >
               {busy["drive-upload"] ? (
@@ -2679,6 +2709,8 @@ function DrivePanel({
                 const r = await run("drive-disconnect", "disconnect_drive");
                 if (r !== undefined) {
                   setStatus(null);
+                  setSnapshots(null);
+                  setSnapshotId("");
                   check();
                 }
               }}
@@ -2691,6 +2723,214 @@ function DrivePanel({
             sync. Offline uploads report a connection failure; your local
             project remains untouched.
           </p>
+          <div className="drive-restore">
+            <div className="drive-restore-heading">
+              <div>
+                <h3>Restore a cloud project</h3>
+                <p>
+                  Download a backup into a new local folder, then work with it
+                  offline. Existing folders are never overwritten.
+                </p>
+              </div>
+              <button
+                className="button secondary"
+                disabled={busy["drive-list"] || busy["drive-restore"]}
+                onClick={async () => {
+                  setRestoreError("");
+                  const result = await run(
+                    "drive-list",
+                    "list_drive_snapshots",
+                  );
+                  if (result) {
+                    const files = Array.isArray(result.files)
+                      ? result.files
+                      : [];
+                    setSnapshots(files);
+                    chooseSnapshot(files[0]?.id || "", files);
+                  } else {
+                    setRestoreError(
+                      "Could not load Drive backups. Check the connection and try again.",
+                    );
+                  }
+                }}
+              >
+                {busy["drive-list"] ? (
+                  <Loader2 size={14} className="spin" />
+                ) : (
+                  <RefreshCw size={14} />
+                )}
+                {busy["drive-list"] ? "Loading backups…" : "Load backups"}
+              </button>
+            </div>
+            {snapshots && snapshots.length === 0 && (
+              <p className="drive-note" role="status">
+                No Agent OS backups were returned. Upload a project snapshot
+                first or check that you connected the correct Drive account.
+              </p>
+            )}
+            {snapshots && snapshots.length > 0 && (
+              <form
+                className="drive-form"
+                onSubmit={async (e) => {
+                  e.preventDefault();
+                  setRestoreError("");
+                  setRestoredPath("");
+                  const name = restoreName.trim();
+                  if (
+                    !name ||
+                    name === "." ||
+                    name === ".." ||
+                    /[<>:"/\\|?*\x00-\x1f]/.test(name) ||
+                    /[. ]$/.test(name)
+                  ) {
+                    setRestoreError(
+                      "Choose a single folder name without slashes or reserved path characters.",
+                    );
+                    return;
+                  }
+                  if (!restoreParent || !snapshotId) return;
+                  const separator = restoreParent.includes("\\") ? "\\" : "/";
+                  const destination =
+                    restoreParent.replace(/[\\/]+$/, "") + separator + name;
+                  const restored = await run(
+                    "drive-restore",
+                    "restore_drive_snapshot",
+                    { fileId: snapshotId, destination },
+                  );
+                  if (!restored?.path) {
+                    setRestoreError(
+                      "The snapshot could not be restored. Check the notification for details; choose a new destination if that folder already exists.",
+                    );
+                    return;
+                  }
+                  setRestoredPath(restored.path);
+                  const snapshot = snapshots.find(
+                    (item) => item.id === snapshotId,
+                  );
+                  const saved = await run("drive-register", "save_workspace", {
+                    workspace: {
+                      name: snapshot?.name?.replace(/\.zip$/i, "") || name,
+                      path: restored.path,
+                      remote: "origin",
+                      branch: "",
+                      validationCommand: "",
+                      autoPublish: false,
+                    },
+                  });
+                  if (saved) {
+                    setProject(saved.id);
+                    notify(
+                      "Drive snapshot restored and added as a local project. You can now assign an agent to it.",
+                    );
+                  } else {
+                    setRestoreError(
+                      "Files were restored, but the project could not be registered. Use Add project with the restored path shown below.",
+                    );
+                  }
+                }}
+              >
+                <label>
+                  Backup to restore
+                  <select
+                    value={snapshotId}
+                    onChange={(e) => chooseSnapshot(e.target.value)}
+                    disabled={busy["drive-restore"] || busy["drive-register"]}
+                    required
+                  >
+                    {snapshots.map((file) => (
+                      <option key={file.id} value={file.id}>
+                        {file.name}
+                        {file.modifiedTime
+                          ? ` · ${new Date(file.modifiedTime).toLocaleDateString()}`
+                          : ""}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <div className="form-row">
+                  <label>
+                    Save inside local folder
+                    <div className="input-button-row">
+                      <input
+                        value={restoreParent}
+                        onChange={(e) => setRestoreParent(e.target.value)}
+                        placeholder="Select an existing parent folder"
+                        required
+                        disabled={busy["drive-restore"]}
+                      />
+                      <button
+                        className="button secondary"
+                        type="button"
+                        aria-label="Choose restore parent folder"
+                        disabled={busy["drive-restore"]}
+                        onClick={async () => {
+                          setRestoreError("");
+                          try {
+                            const picked = await api("pick_folder");
+                            if (picked)
+                              setRestoreParent(
+                                typeof picked === "string"
+                                  ? picked
+                                  : picked.path,
+                              );
+                          } catch (e) {
+                            setRestoreError(String(e));
+                          }
+                        }}
+                      >
+                        <FolderOpen size={16} />
+                      </button>
+                    </div>
+                  </label>
+                  <label>
+                    New folder name
+                    <input
+                      value={restoreName}
+                      onChange={(e) => setRestoreName(e.target.value)}
+                      placeholder="my-restored-project"
+                      maxLength={100}
+                      disabled={busy["drive-restore"]}
+                      required
+                    />
+                  </label>
+                </div>
+                <button
+                  className="button primary"
+                  disabled={
+                    !snapshotId ||
+                    !restoreParent ||
+                    !restoreName.trim() ||
+                    busy["drive-restore"] ||
+                    busy["drive-register"]
+                  }
+                >
+                  {busy["drive-restore"] || busy["drive-register"] ? (
+                    <Loader2 size={15} className="spin" />
+                  ) : (
+                    <ArrowDownToLine size={15} />
+                  )}
+                  {busy["drive-restore"]
+                    ? "Restoring snapshot…"
+                    : busy["drive-register"]
+                      ? "Adding local project…"
+                      : "Restore as local project"}
+                </button>
+              </form>
+            )}
+            {restoredPath && (
+              <p className="drive-restored-path" role="status">
+                <CheckCircle2 size={14} />
+                <span>
+                  Snapshot restored to <code>{restoredPath}</code>
+                </span>
+              </p>
+            )}
+            {restoreError && (
+              <p className="drive-error" role="alert">
+                {restoreError}
+              </p>
+            )}
+          </div>
         </div>
       )}
       {error && (

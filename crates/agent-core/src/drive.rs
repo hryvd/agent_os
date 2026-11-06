@@ -25,6 +25,8 @@ const SERVICE: &str = "dev.agentos.desktop";
 const ACCOUNT: &str = "google-drive";
 const TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 const CHUNK_BYTES: usize = 4 * 1024 * 1024;
+const MAX_SNAPSHOT_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_SNAPSHOT_FILES: usize = 10_000;
 static AUTH_GENERATION: AtomicU64 = AtomicU64::new(0);
 static AUTH_STORE_LOCK: Mutex<()> = Mutex::new(());
 
@@ -455,9 +457,455 @@ pub async fn upload_snapshot(
     Err("Drive upload did not produce a receipt.".into())
 }
 
+fn drive_file_id(value: &str) -> Result<&str, String> {
+    if value.is_empty()
+        || value.len() > 256
+        || !value
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-')
+    {
+        return Err("Invalid Drive file ID.".into());
+    }
+    Ok(value)
+}
+
+async fn bounded_document(mut response: reqwest::Response) -> Result<Value, String> {
+    if response
+        .content_length()
+        .is_some_and(|size| size > 1024 * 1024)
+    {
+        return Err("Drive response exceeded its 1 MiB limit.".into());
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|_| "Could not read Drive's response")?
+    {
+        if bytes.len() + chunk.len() > 1024 * 1024 {
+            return Err("Drive response exceeded its 1 MiB limit.".into());
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&bytes).map_err(|_| "Drive returned invalid JSON.".into())
+}
+
+/// Return a bounded page of this application's snapshots, never the user's whole Drive.
+pub async fn list_snapshots(client_id: &str) -> Result<Value, String> {
+    let token = access_token(client_id).await?;
+    let response = client()?
+        .get("https://www.googleapis.com/drive/v3/files")
+        .bearer_auth(token)
+        .query(&[
+            (
+                "q",
+                "trashed = false and appProperties has { key='agentOsSnapshot' and value='true' }",
+            ),
+            ("fields", "files(id,name,size,modifiedTime),nextPageToken"),
+            ("pageSize", "100"),
+            ("orderBy", "modifiedTime desc"),
+            ("spaces", "drive"),
+        ])
+        .send()
+        .await
+        .map_err(|_| "Could not list Drive snapshots. Check your connection.".to_string())?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "Drive could not list snapshots (HTTP {}). Reconnect if authorization expired.",
+            response.status().as_u16()
+        ));
+    }
+    let document = bounded_document(response).await?;
+    let files = document
+        .get("files")
+        .and_then(Value::as_array)
+        .ok_or("Drive did not supply a snapshot list.")?;
+    if files.len() > 100 {
+        return Err("Drive returned more snapshots than requested.".into());
+    }
+    Ok(
+        json!({"files":files,"limit":100,"hasMore":document.get("nextPageToken").and_then(Value::as_str).is_some()}),
+    )
+}
+
+struct TemporaryDownload(std::path::PathBuf);
+impl Drop for TemporaryDownload {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+fn restore_destination(destination: &Path) -> Result<std::path::PathBuf, String> {
+    let leaf = destination
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or("Choose a new project folder name.")?;
+    let relative = super::tools::relative_path(leaf, false)?;
+    if relative.components().count() != 1 {
+        return Err("Choose a single new project folder name.".into());
+    }
+    let parent = destination
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let parent = super::tools::root_path(parent)?;
+    let target = parent.join(relative);
+    if std::fs::symlink_metadata(&target).is_ok() {
+        return Err("The restore destination already exists. Choose a new folder; existing files are never overwritten.".into());
+    }
+    Ok(target)
+}
+
+/// Download to disk, then reserve a new destination and extract only safe files.
+pub async fn restore_snapshot(
+    client_id: &str,
+    file_id: &str,
+    destination: &Path,
+) -> Result<Value, String> {
+    let file_id = drive_file_id(file_id)?;
+    let destination = restore_destination(destination)?;
+    let token = access_token(client_id).await?;
+    let http = client()?;
+    let metadata = http
+        .get(format!(
+            "https://www.googleapis.com/drive/v3/files/{file_id}"
+        ))
+        .bearer_auth(&token)
+        .query(&[("fields", "id,mimeType,size,appProperties")])
+        .send()
+        .await
+        .map_err(|_| "Could not inspect the Drive snapshot. Check your connection.".to_string())?;
+    if !metadata.status().is_success() {
+        return Err(format!(
+            "Drive could not inspect the snapshot (HTTP {}).",
+            metadata.status().as_u16()
+        ));
+    }
+    let metadata = bounded_document(metadata).await?;
+    if metadata
+        .pointer("/appProperties/agentOsSnapshot")
+        .and_then(Value::as_str)
+        != Some("true")
+        || metadata.get("mimeType").and_then(Value::as_str) != Some("application/zip")
+    {
+        return Err("Select a ZIP snapshot created by Agent OS.".into());
+    }
+    if metadata
+        .get("size")
+        .and_then(Value::as_str)
+        .and_then(|s| s.parse::<u64>().ok())
+        .is_some_and(|n| n > MAX_SNAPSHOT_BYTES)
+    {
+        return Err("This snapshot exceeds the 256 MiB download limit.".into());
+    }
+    let mut response = http
+        .get(format!(
+            "https://www.googleapis.com/drive/v3/files/{file_id}"
+        ))
+        .bearer_auth(token)
+        .query(&[("alt", "media")])
+        .send()
+        .await
+        .map_err(|_| "Could not download the Drive snapshot. Check your connection.".to_string())?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "Drive download failed (HTTP {}).",
+            response.status().as_u16()
+        ));
+    }
+    if response
+        .content_length()
+        .is_some_and(|size| size > MAX_SNAPSHOT_BYTES)
+    {
+        return Err("This snapshot exceeds the 256 MiB download limit.".into());
+    }
+    // Initialize cleanup only after create_new succeeds; never remove an existing file.
+    let temporary;
+    let download_path = destination
+        .parent()
+        .ok_or("Invalid restore parent")?
+        .join(format!(".agent-os-download-{}.zip.part", Uuid::new_v4()));
+    let mut file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&download_path)
+        .await
+        .map_err(|_| "Could not create the temporary snapshot download.".to_string())?;
+    temporary = TemporaryDownload(download_path);
+    let mut total = 0u64;
+    while let Some(chunk) = response.chunk().await.map_err(|_| {
+        "Drive download was interrupted. Try restoring again when online.".to_string()
+    })? {
+        total = total
+            .checked_add(chunk.len() as u64)
+            .ok_or("Snapshot size overflow")?;
+        if total > MAX_SNAPSHOT_BYTES {
+            return Err("This snapshot exceeds the 256 MiB download limit.".into());
+        }
+        file.write_all(&chunk)
+            .await
+            .map_err(|_| "Could not save the downloaded snapshot. Check disk space.".to_string())?;
+    }
+    file.flush()
+        .await
+        .map_err(|_| "Could not finish saving the snapshot.".to_string())?;
+    drop(file);
+    let archive = temporary.0.clone();
+    tokio::task::spawn_blocking(move || {
+        extract_snapshot(
+            &archive,
+            &destination,
+            MAX_SNAPSHOT_BYTES,
+            MAX_SNAPSHOT_BYTES,
+            MAX_SNAPSHOT_FILES,
+        )
+    })
+    .await
+    .map_err(|_| "Snapshot restoration was interrupted.".to_string())?
+}
+
+fn extract_snapshot(
+    archive_path: &Path,
+    destination: &Path,
+    compressed_limit: u64,
+    expanded_limit: u64,
+    file_limit: usize,
+) -> Result<Value, String> {
+    use std::{
+        fs::{self, File, OpenOptions},
+        io::{Read, Write},
+    };
+    if fs::metadata(archive_path)
+        .map_err(|_| "Snapshot download is unavailable")?
+        .len()
+        > compressed_limit
+    {
+        return Err("Compressed snapshot exceeds the restore limit.".into());
+    }
+    let mut archive =
+        zip::ZipArchive::new(File::open(archive_path).map_err(|_| "Cannot open snapshot ZIP")?)
+            .map_err(|_| "Snapshot is not a supported ZIP archive")?;
+    if archive.len() > file_limit {
+        return Err("Snapshot contains too many entries.".into());
+    }
+    let mut expanded = 0u64;
+    let mut paths = std::collections::HashSet::new();
+    // Validate every entry before reserving a destination or writing any file.
+    for index in 0..archive.len() {
+        let entry = archive
+            .by_index(index)
+            .map_err(|_| "Snapshot contains an unreadable or encrypted entry")?;
+        let name = std::str::from_utf8(entry.name_raw())
+            .map_err(|_| "Snapshot contains a non-UTF-8 filename")?;
+        let relative = super::tools::relative_path(name, false)?;
+        if !paths.insert(relative) {
+            return Err("Snapshot contains duplicate file paths.".into());
+        }
+        if let Some(mode) = entry.unix_mode() {
+            let kind = mode & 0o170000;
+            if kind != 0 && kind != 0o100000 && kind != 0o040000 {
+                return Err("Snapshot links and special file entries are not supported.".into());
+            }
+        }
+        expanded = expanded
+            .checked_add(entry.size())
+            .ok_or("Snapshot expansion overflow")?;
+        if expanded > expanded_limit {
+            return Err("Expanded snapshot exceeds the restore limit.".into());
+        }
+    }
+    let destination = restore_destination(destination)?;
+    // create_dir is the atomic no-overwrite reservation. Never rename over a directory.
+    fs::create_dir(&destination)
+        .map_err(|_| "Could not reserve the new project folder; it may already exist")?;
+    let result = (|| {
+        let root = super::tools::root_path(&destination)?;
+        let mut files = 0usize;
+        let mut written = 0u64;
+        for index in 0..archive.len() {
+            let mut entry = archive
+                .by_index(index)
+                .map_err(|_| "Cannot read snapshot entry")?;
+            let relative = super::tools::relative_path(
+                std::str::from_utf8(entry.name_raw()).map_err(|_| "Invalid snapshot filename")?,
+                false,
+            )?;
+            let target = super::tools::resolve(&root, &relative, true)?;
+            if entry.is_dir() {
+                match fs::create_dir(&target) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                        let meta = fs::symlink_metadata(&target)
+                            .map_err(|_| "Cannot inspect restored directory")?;
+                        if !meta.is_dir() || meta.file_type().is_symlink() {
+                            return Err("A restored directory path is unsafe".into());
+                        }
+                    }
+                    Err(_) => return Err("Could not create a restored directory".into()),
+                }
+                continue;
+            }
+            let mut output = OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&target)
+                .map_err(|_| "Could not create a restored file without overwriting")?;
+            let mut buffer = [0u8; 65536];
+            let mut file_size = 0u64;
+            loop {
+                let count = entry
+                    .read(&mut buffer)
+                    .map_err(|_| "Snapshot contents failed integrity verification")?;
+                if count == 0 {
+                    break;
+                }
+                written = written
+                    .checked_add(count as u64)
+                    .ok_or("Snapshot expansion overflow")?;
+                file_size += count as u64;
+                if written > expanded_limit {
+                    return Err("Expanded snapshot exceeds the restore limit.".into());
+                }
+                output
+                    .write_all(&buffer[..count])
+                    .map_err(|_| "Could not write restored files; check disk space")?;
+            }
+            if file_size != entry.size() {
+                return Err("Snapshot file size did not match its ZIP metadata.".into());
+            }
+            files += 1;
+        }
+        Ok(
+            json!({"restored":true,"path":root.to_string_lossy(),"files":files,"bytes":written,"detail":"Restored into a new local project folder. Register it as a workspace to use agents offline."}),
+        )
+    })();
+    if result.is_err() {
+        let _ = fs::remove_dir_all(&destination);
+    }
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn zip_fixture(path: &Path, entries: &[(&str, &str)]) {
+        use std::io::Write;
+        let file = std::fs::File::create(path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        for (name, content) in entries {
+            zip.start_file(
+                *name,
+                zip::write::SimpleFileOptions::default()
+                    .compression_method(zip::CompressionMethod::Stored),
+            )
+            .unwrap();
+            zip.write_all(content.as_bytes()).unwrap();
+        }
+        zip.finish().unwrap();
+    }
+
+    #[test]
+    fn restores_snapshot_into_new_folder_without_overwriting() {
+        let temp = tempfile::tempdir().unwrap();
+        let archive = temp.path().join("snapshot.zip");
+        zip_fixture(
+            &archive,
+            &[("README.md", "restored"), ("src/main.txt", "code")],
+        );
+        let target = temp.path().join("restored");
+        let receipt = extract_snapshot(&archive, &target, 1024 * 1024, 1024 * 1024, 10).unwrap();
+        assert_eq!(receipt["files"], 2);
+        assert_eq!(
+            std::fs::read_to_string(target.join("src/main.txt")).unwrap(),
+            "code"
+        );
+        std::fs::write(target.join("keep.txt"), "user data").unwrap();
+        assert!(extract_snapshot(&archive, &target, 1024 * 1024, 1024 * 1024, 10).is_err());
+        assert_eq!(
+            std::fs::read_to_string(target.join("keep.txt")).unwrap(),
+            "user data"
+        );
+    }
+
+    #[test]
+    fn rejects_zip_slip_private_paths_windows_aliases_and_symlinks() {
+        use std::io::Write;
+        let temp = tempfile::tempdir().unwrap();
+        let archive = temp.path().join("unsafe.zip");
+        for bad in [
+            "../escape.txt",
+            "/absolute.txt",
+            "C:/outside.txt",
+            "folder\\escape.txt",
+            "CON.txt",
+            "src/trailing. ",
+            ".env",
+            ".ssh/id_rsa",
+            ".git/config",
+            "secrets/private.key",
+        ] {
+            zip_fixture(&archive, &[(bad, "must not restore")]);
+            let target = temp.path().join("output");
+            assert!(
+                extract_snapshot(&archive, &target, 1024 * 1024, 1024 * 1024, 10).is_err(),
+                "accepted {bad}"
+            );
+            assert!(!target.exists());
+        }
+        let file = std::fs::File::create(&archive).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        zip.add_symlink(
+            "link",
+            "../outside",
+            zip::write::SimpleFileOptions::default(),
+        )
+        .unwrap();
+        zip.finish().unwrap();
+        assert!(extract_snapshot(
+            &archive,
+            &temp.path().join("output"),
+            1024 * 1024,
+            1024 * 1024,
+            10
+        )
+        .is_err());
+        // A CRC failure during extraction cleans only the newly reserved folder.
+        zip_fixture(&archive, &[("ok.txt", "hello")]);
+        let mut bytes = std::fs::read(&archive).unwrap();
+        let index = bytes
+            .windows(5)
+            .position(|window| window == b"hello")
+            .expect("stored fixture payload");
+        bytes[index] = b'X';
+        std::fs::File::create(&archive)
+            .unwrap()
+            .write_all(&bytes)
+            .unwrap();
+        assert!(extract_snapshot(
+            &archive,
+            &temp.path().join("damaged"),
+            1024 * 1024,
+            1024 * 1024,
+            10
+        )
+        .is_err());
+        assert!(!temp.path().join("damaged").exists());
+    }
+
+    #[test]
+    fn bounds_restore_compressed_expanded_and_file_count() {
+        let temp = tempfile::tempdir().unwrap();
+        let archive = temp.path().join("bounded.zip");
+        zip_fixture(&archive, &[("one.txt", "12345"), ("two.txt", "12345")]);
+        let target = temp.path().join("output");
+        assert!(extract_snapshot(&archive, &target, 4, 1024 * 1024, 10).is_err());
+        assert!(extract_snapshot(&archive, &target, 1024 * 1024, 9, 10).is_err());
+        assert!(extract_snapshot(&archive, &target, 1024 * 1024, 1024 * 1024, 1).is_err());
+        assert!(!target.exists());
+        assert!(drive_file_id("../../bad").is_err());
+        assert!(drive_file_id("valid_drive-id_1").is_ok());
+    }
 
     #[tokio::test]
     async fn desktop_authorization_uses_pkce_and_loopback() {

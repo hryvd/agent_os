@@ -56,7 +56,7 @@ API keys and Drive refresh tokens use the operating system credential store, not
 
 **Ponytail:** the per-agent profile adds simplification and verification instructions. It does not falsely report that the upstream plugin is installed. For the full native plugin and its host-specific review/audit commands, follow the [official Ponytail installation](https://github.com/dietrichgebert/ponytail). Existing project instruction files are not overwritten.
 
-**Google Antigravity:** direct external task control is not implemented. Official CLI documentation could not be verified because the cloud network policy blocks its documentation host. This is not a claim that the product lacks an API. The application does not scrape an IDE session or repurpose account cookies.
+**Google Antigravity:** OmniRoute documents an Antigravity provider/OAuth helper in its [remote-mode guide](https://github.com/cheaper-inference/OmniRoute/blob/main/docs/guides/REMOTE-MODE.md). Agent OS can use model IDs exposed by your configured gateway, subject to provider eligibility and availability. This is separate from direct control of Google's IDE/CLI, which is not implemented: its official execution contract could not be verified under the cloud documentation-host policy. The application does not scrape IDE sessions or repurpose account cookies.
 
 ## Google Drive and offline files
 
@@ -64,7 +64,11 @@ Drive integration uses a Google OAuth **Desktop app** client with the Drive API 
 
 Project backups are versioned ZIP snapshots uploaded through a resumable, bounded-memory transfer. Choose a local export directory or use the connected Drive backup action. An optional Drive folder must be accessible under the app's OAuth scope. Snapshots omit Git internals, build caches, credential/config files, and symlinks. Inspect what a project contains before uploading it.
 
-Local files, history, and local models can work offline. Cloud inference, Drive uploads, and Git pushes need a connection. Drive is snapshot backup, not live two-way synchronization or a replacement for a local execution directory. Failed uploads and pushes remain visible; do not assume they completed.
+To recover a cloud project, open **Projects → Google Drive snapshots → Load backups**. Select a backup, choose an existing parent directory and a new folder name, then **Restore as local project**. The app downloads and validates the ZIP, refuses to overwrite an existing directory, and registers the restored folder as a local workspace. Git internals are excluded from backups, so restoring files does not restore a repository's authentication or Git history.
+
+The list shows the latest 100 snapshots created by this application. Restore limits are 256 MiB downloaded, 256 MiB expanded, and 10,000 entries. Unsafe paths, links, private-file aliases, and corrupt archives are rejected.
+
+Local files, history, restored projects, and local models can work offline. Cloud inference, Drive transfers, and Git pushes need a connection. Drive provides snapshot backup and recovery, not live two-way synchronization or a replacement for a local execution directory. Failed transfers and pushes remain visible; do not assume they completed.
 
 ## Verified publishing
 
@@ -76,7 +80,7 @@ Publishing checks that the candidate and approved destination still match, creat
 
 Designed for a Ryzen 4500 / GTX 1650 / 8 GB RAM target, with two cloud run slots and one local run slot. Actual Windows memory/frame-rate measurements on that device are still required. Task count and model context are bounded; project edits are coordinated rather than allowing workers to overwrite a shared checkout concurrently.
 
-Use efficient graphics or the equivalent 2D team view. The office pauses when hidden and scales render resolution. One local model can serve several saved agents sequentially. Models and CLI subprocesses consume memory in addition to the application.
+Use efficient graphics or the equivalent 2D team view. Balanced graphics enables glass refraction; Efficient avoids the extra scene pass. The office pauses when hidden and scales render resolution. One local run slot serves saved agents sequentially, with a conservative 2,048-token Ollama context. Models and CLI subprocesses consume memory in addition to the application.
 
 OmniRoute's [coding-workload guide](https://github.com/cheaper-inference/OmniRoute/blob/main/docs/guides/DOCKER_GUIDE.md#runtime-ram-for-coding-agents) recommends memory configurations larger than this machine's entire RAM for long coding sessions. Running its complete coding gateway locally is not a supported hardware claim here. A remote gateway or direct provider connection avoids that extra local service. Virtual RAM does not replace VRAM or make large models fast.
 

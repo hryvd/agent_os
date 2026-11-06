@@ -222,11 +222,14 @@ export default function Office({
     }
     plant(-5, back + 1.05);
     plant(5, depth / 2 - 0.85);
-    // Glass meeting zone at the side: thin panes and bright edge catches, no expensive transmission.
+    // Transmission adds a scene pass, so keep refraction opt-in on small devices.
     const glassMaterial = new THREE.MeshPhysicalMaterial({
       color: "#d4e4ed",
       transparent: true,
-      opacity: 0.16,
+      opacity: quality === "balanced" ? 1 : 0.16,
+      transmission: quality === "balanced" ? 0.85 : 0,
+      thickness: quality === "balanced" ? 0.08 : 0,
+      ior: 1.45,
       roughness: 0.08,
       metalness: 0.1,
       side: THREE.DoubleSide,

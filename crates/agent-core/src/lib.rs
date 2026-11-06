@@ -170,7 +170,7 @@ impl Core {
     pub async fn execute(&self, command: &str, payload: Value) -> Result<Value, String> {
         match command {
             "bootstrap" => Ok(
-                json!({"agents":self.list("agents")?,"tasks":self.list("tasks")?,"messages":self.list("messages")?,"connections":self.list("connections")?,"workspaces":self.list("workspaces")?,"settings":self.get("settings","app")?,"capabilities":{"desktop":true,"googleDriveOAuth":true,"antigravity":false,"streaming":false,"delegation":true}}),
+                json!({"agents":self.list("agents")?,"tasks":self.list("tasks")?,"messages":self.list("messages")?,"connections":self.list("connections")?,"workspaces":self.list("workspaces")?,"settings":self.get("settings","app")?,"capabilities":{"desktop":true,"googleDriveOAuth":true,"fileTools":true,"antigravity":false,"streaming":false,"delegation":true}}),
             ),
             "save_agent" => self.save_agent(object(&payload, "agent")?),
             "delete_agent" => {
@@ -366,6 +366,23 @@ impl Core {
                     let _ = std::fs::remove_file(destination);
                 }
                 result
+            }
+            "list_drive_snapshots" => {
+                let config = self
+                    .get("drive", "status")
+                    .map_err(|_| "Connect Google Drive first".to_string())?;
+                drive::list_snapshots(required(&config, "clientId")?).await
+            }
+            "restore_drive_snapshot" => {
+                let config = self
+                    .get("drive", "status")
+                    .map_err(|_| "Connect Google Drive first".to_string())?;
+                drive::restore_snapshot(
+                    required(&config, "clientId")?,
+                    required(&payload, "fileId")?,
+                    std::path::Path::new(required(&payload, "destination")?),
+                )
+                .await
             }
             _ => Err(format!("Unsupported command: {command}")),
         }
@@ -871,7 +888,7 @@ impl Core {
         };
         for _round in 0..8 {
             let mut body = if kind == "ollama" {
-                json!({"model":model,"messages":messages,"stream":false,"keep_alive":"1m","options":{"num_ctx":4096}})
+                json!({"model":model,"messages":messages,"stream":false,"keep_alive":"1m","options":{"num_ctx":2048}})
             } else {
                 json!({"model":model,"messages":messages,"stream":false,"max_tokens":2048})
             };

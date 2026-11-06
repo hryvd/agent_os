@@ -97,3 +97,85 @@ test("desktop connection form sends the configured provider through the native b
   expect(["localhost", "127.0.0.1"]).toContain(endpoint.hostname);
   expect(endpoint.port).toBe("11434");
 });
+
+test("balanced office renders and Drive restore registers the returned local project", async ({
+  page,
+}) => {
+  await page.addInitScript(() => {
+    const state: any = {
+      agents: [
+        {
+          id: "lead",
+          name: "Atlas",
+          role: "Lead",
+          provider: "local",
+          model: "small",
+          color: "#a998ed",
+        },
+      ],
+      tasks: [],
+      messages: [],
+      connections: [],
+      workspaces: [],
+      settings: { quality: "balanced" },
+    };
+    (window as any).__commands = [];
+    (window as any).__TAURI_INTERNALS__ = {
+      invoke: async (_: string, args: any) => {
+        (window as any).__commands.push(args);
+        switch (args.command) {
+          case "bootstrap":
+            return structuredClone(state);
+          case "drive_status":
+            return { connected: true };
+          case "list_drive_snapshots":
+            return { files: [{ id: "backup-1", name: "studio.zip" }] };
+          case "pick_folder":
+            return "C:\\Projects";
+          case "restore_drive_snapshot":
+            return { path: args.payload.destination, files: 3 };
+          case "save_workspace": {
+            const workspace = { ...args.payload.workspace, id: "restored" };
+            state.workspaces.push(workspace);
+            return workspace;
+          }
+          default:
+            throw new Error(`Unexpected test command: ${args.command}`);
+        }
+      },
+    };
+  });
+  const errors: string[] = [];
+  page.on("pageerror", (error) => errors.push(error.message));
+  page.on("console", (message) => {
+    if (message.type() === "error" && message.text().includes("THREE"))
+      errors.push(message.text());
+  });
+  await page.goto("/");
+  await expect(page.getByTestId("office-canvas")).toBeVisible();
+  await expect(
+    page.getByRole("button", { name: "Message Atlas", exact: true }),
+  ).toBeVisible();
+  await page.getByRole("button", { name: "Workspaces", exact: true }).click();
+  await page.getByRole("button", { name: "Load backups", exact: true }).click();
+  await expect(page.getByLabel("Backup to restore")).toHaveValue("backup-1");
+  await page
+    .getByRole("button", { name: "Choose restore parent folder", exact: true })
+    .click();
+  await page.getByLabel("New folder name", { exact: true }).fill("Recovered");
+  await page
+    .getByRole("button", { name: "Restore as local project", exact: true })
+    .click();
+  await expect(
+    page.getByText("C:\\Projects\\Recovered", { exact: true }).first(),
+  ).toBeVisible();
+  const commands = await page.evaluate(() => (window as any).__commands);
+  expect(
+    commands.find((c: any) => c.command === "restore_drive_snapshot").payload,
+  ).toEqual({ fileId: "backup-1", destination: "C:\\Projects\\Recovered" });
+  expect(
+    commands.find((c: any) => c.command === "save_workspace").payload.workspace
+      .path,
+  ).toBe("C:\\Projects\\Recovered");
+  expect(errors).toEqual([]);
+});

@@ -56,7 +56,7 @@ fn restricted(path: &Path) -> bool {
     })
 }
 
-fn relative_path(value: &str, allow_root: bool) -> Result<PathBuf, String> {
+pub(super) fn relative_path(value: &str, allow_root: bool) -> Result<PathBuf, String> {
     if value.is_empty() || value == "." {
         return if allow_root {
             Ok(PathBuf::new())
@@ -102,7 +102,7 @@ fn relative_path(value: &str, allow_root: bool) -> Result<PathBuf, String> {
     Ok(path)
 }
 
-fn root_path(root: &Path) -> Result<PathBuf, String> {
+pub(super) fn root_path(root: &Path) -> Result<PathBuf, String> {
     let root =
         fs::canonicalize(root).map_err(|e| format!("Cannot open the approved workspace: {e}"))?;
     if !root.is_dir() {
@@ -124,7 +124,11 @@ fn root_path(root: &Path) -> Result<PathBuf, String> {
     Ok(root)
 }
 
-fn resolve(root: &Path, relative: &Path, create_parents: bool) -> Result<PathBuf, String> {
+pub(super) fn resolve(
+    root: &Path,
+    relative: &Path,
+    create_parents: bool,
+) -> Result<PathBuf, String> {
     let mut current = root.to_path_buf();
     let components: Vec<_> = relative.components().collect();
     for (index, component) in components.iter().enumerate() {
