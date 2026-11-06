@@ -1,0 +1,13 @@
+node_modules/
+dist/
+target/
+src-tauri/target/
+src-tauri/gen/
+crates/*/target/
+.env
+.env.*
+!.env.example
+*.log
+test-results/
+playwright-report/
+.DS_Store
